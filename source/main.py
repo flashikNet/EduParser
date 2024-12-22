@@ -6,6 +6,27 @@ from database import AsyncSessionLocal, init_db
 from models import Sneaker
 from pydantic import BaseModel
 from parser import save_sneakers_to_db
+from fastapi import WebSocket, WebSocketDisconnect
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection.send_text(message)
+
+
+manager = ConnectionManager()
+
 
 app = FastAPI(on_startup=[init_db])
 
@@ -23,10 +44,42 @@ class SneakerUpdate(BaseModel):
     brand: str | None = None
 
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    ## WebSocket Уведомления
+    Этот WebSocket позволяет получать уведомления о действиях с данными.
+
+    ### Пример использования на js:
+    ```javascript
+    const socket = new WebSocket("ws://localhost:8000/ws");
+
+    socket.onopen = () => {
+    console.log("Соединение установлено");
+    };
+
+    socket.onmessage = (event) => {
+        console.log("Уведомление:", event.data);
+    };
+
+    socket.onclose = () => {
+        console.log("Соединение закрыто");
+    };
+    ```
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # Ожидаем сообщения от клиента
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
 # Эндпоинт для парсинга и наполнения БД
 @app.post("/parse/{brand}")
 async def parse_brand(brand: str, db: AsyncSession = Depends(get_db)):
     await save_sneakers_to_db(brand, db)
+    await manager.broadcast(f"Бренд {brand} успешно обновлён в базе данных.")
     return {"message": f"Парсинг завершён для бренда: {brand}"}
 
 
@@ -39,6 +92,7 @@ async def read_sneakers(brand: str, db: AsyncSession = Depends(get_db)):
     if not sneakers:
         raise HTTPException(status_code=404, detail="Кроссовки не найдены")
 
+    await manager.broadcast(f"Данные для бренда {brand} запрошены.")
     return [{
         "id": s.id,
         "name": s.name,
@@ -66,6 +120,7 @@ async def update_sneaker(sneaker_id: int,
         sneaker.brand = sneaker_data.brand
 
     await db.commit()
+    await manager.broadcast(f"Кроссовок с ID {sneaker_id} обновлён.")
     return {"message": "Кроссовок успешно обновлён",
             "sneaker": {
                 "id": sneaker.id,
@@ -75,9 +130,8 @@ async def update_sneaker(sneaker_id: int,
                 }
             }
 
+
 # Эндпоинт для удаления кроссовка из БД
-
-
 @app.delete("/sneakers/{sneaker_id}")
 async def delete_sneaker(sneaker_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Sneaker).filter(Sneaker.id == sneaker_id))
@@ -88,5 +142,5 @@ async def delete_sneaker(sneaker_id: int, db: AsyncSession = Depends(get_db)):
 
     await db.delete(sneaker)
     await db.commit()
-
+    await manager.broadcast(f"Кроссовок с ID {sneaker_id} удалён.")
     return {"message": "Кроссовок успешно удалён"}
